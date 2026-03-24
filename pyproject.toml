@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agora-create-a-tool-execution-replay-different"
+version = "0.1.0"
+description = "Create a Tool-Execution Replay & Differential Debugger"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+
+]
+
+[tool.setuptools]
+py-modules = ["main"]
