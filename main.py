@@ -6,17 +6,14 @@ A utility for capturing, replaying, and diffing tool executions to diagnose
 drift, environment changes, and contract mismatches.
 
 Usage:
-    # Replay a captured execution and compare with stored output
+    # Replay a captured execution (show stored result)
     python3 main.py replay execution_bundle.json
 
-    # Replay with a fresh implementation to detect drift
+    # Replay with fresh execution to detect drift
     python3 main.py replay execution_bundle.json --fresh
 
     # Generate a diff report between two execution bundles
     python3 main.py diff old_bundle.json new_bundle.json
-
-    # Create sample execution bundle for testing
-    python3 main.py capture --tool test_tool --args '{"query": "test"}' sample.json
 """
 from __future__ import annotations
 import argparse
@@ -27,9 +24,8 @@ import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 import difflib
-import subprocess
 
 
 @dataclass
@@ -38,14 +34,13 @@ class ExecutionBundle:
     tool_name: str
     tool_call_id: str
     tool_version: str  # implementation hash
-    input_args: dict[str, Any]
+    input_args: dict[int, Any]  # positional args stored as {index: value}
     input_kwargs: dict[str, Any]
     env_fingerprint: dict[str, str]
     output: Any
     error: str | None = None
     duration_ms: int = 0
     timestamp: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
-    metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         result = {
@@ -61,8 +56,6 @@ class ExecutionBundle:
         }
         if self.error:
             result["error"] = self.error
-        if self.metadata:
-            result["metadata"] = self.metadata
         return result
 
     @classmethod
@@ -78,16 +71,7 @@ class ExecutionBundle:
             error=d.get("error"),
             duration_ms=d.get("duration_ms", 0),
             timestamp=d.get("timestamp", datetime.now(timezone.utc).isoformat()),
-            metadata=d.get("metadata", {}),
         )
-
-    def compute_hash(self) -> str:
-        """Compute a deterministic hash of the execution context."""
-        hasher = hashlib.sha256()
-        hasher.update(self.tool_name.encode())
-        hasher.update(json.dumps(self.input_args, sort_keys=True).encode())
-        hasher.update(json.dumps(self.input_kwargs, sort_keys=True).encode())
-        return hasher.hexdigest()[:16]
 
 
 @dataclass
@@ -99,7 +83,7 @@ class ReplayResult:
     duration_ms: int = 0
     tool_version: str = ""
     diff_explanation: str = ""
-    change_type: str = "unknown"  # none, drift, env_change, contract_change, failure
+    change_type: str = "none"  # none, drift, contract_change
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -118,41 +102,101 @@ class ToolLoader:
 
     def __init__(self, tool_path: Path | None = None):
         self.tool_path = tool_path
-        self._cache: dict[str, Callable] = {}
+        self._cache: dict[str, Any] = {}
 
-    def load_tool(self, tool_name: str) -> Callable | None:
-        """Load a tool function by name."""
+    def load_tool(self, tool_name: str) -> tuple[Any, str] | None:
+        """
+        Load a tool function by name.
+
+        Returns:
+            (tool_callable, version_info) or None if not found
+        """
         if tool_name in self._cache:
             return self._cache[tool_name]
 
-        tool_fn = None
+        result = None
 
-        # Try direct Python module loading if path provided
+        # Strategy 1: Direct module loading from specified path
         if self.tool_path and self.tool_path.exists():
-            spec = importlib.util.spec_from_file_location("tool_module", self.tool_path)
-            if spec and spec.loader:
-                module = importlib.util.module_from_spec(spec)
-                try:
-                    spec.loader.exec_module(module)
-                    tool_fn = getattr(module, tool_name, None)
-                except Exception:
-                    pass
+            result = self._load_from_path(tool_name, self.tool_path)
 
-        # Try to import from standard locations
-        if tool_fn is None:
-            try:
-                # Remove 'tools.' prefix if present
-                import_name = tool_name.lstrip("tools.")
-                module_name, fn_name = import_name.rsplit(".", 1) if "." in import_name else ("tools", import_name)
-                mod = __import__(module_name, fromlist=[fn_name])
-                tool_fn = getattr(mod, fn_name)
-            except Exception:
-                pass
+        # Strategy 2: Try importing from installed location
+        if result is None:
+            result = self._load_from_import(tool_name)
 
-        if tool_fn:
-            self._cache[tool_name] = tool_fn
+        # Strategy 3: Try loading from common tool patterns
+        if result is None and self.tool_path is None and "." not in tool_name:
+            # Maybe the tool is in a file with the same name in current directory
+            local_path = Path(f"{tool_name}.py")
+            if local_path.exists():
+                result = self._load_from_path(tool_name, local_path)
 
-        return tool_fn
+        if result:
+            self._cache[tool_name] = result
+
+        return result
+
+    def _load_from_path(self, tool_name: str, path: Path) -> tuple[Any, str] | None:
+        """Load tool from a specific Python file."""
+        try:
+            spec = importlib.util.spec_from_file_location("_replay_tool_module", path)
+            if not spec or not spec.loader:
+                return None
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+
+            # Try exact name first
+            if hasattr(module, tool_name):
+                fn = getattr(module, tool_name)
+                if callable(fn):
+                    version = self._compute_version(path)
+                    return (fn, version)
+
+            # Try common tool function patterns
+            common_names = ["main", "run", "execute", "tool", "handler"]
+            for name in common_names:
+                if hasattr(module, name):
+                    fn = getattr(module, name)
+                    if callable(fn):
+                        version = self._compute_version(path)
+                        return (fn, version)
+
+            return None
+        except Exception:
+            return None
+
+    def _load_from_import(self, tool_name: str) -> tuple[Any, str] | None:
+        """Load tool via standard Python import."""
+        try:
+            import_name = tool_name.lstrip("tools.")
+            parts = import_name.split(".")
+            if len(parts) == 1:
+                # Assume tools.<name> module with <name> function
+                module_name = f"tools.{import_name}"
+                fn_name = import_name
+            else:
+                module_name = import_name
+                fn_name = parts[-1]
+
+            mod = __import__(module_name, fromlist=[fn_name])
+            fn = getattr(mod, fn_name)
+            if callable(fn):
+                # Try to find the module file for version computation
+                if hasattr(mod, "__file__") and mod.__file__:
+                    version = self._compute_version(Path(mod.__file__))
+                else:
+                    version = "imported"
+                return (fn, version)
+        except Exception:
+            return None
+
+    def _compute_version(self, path: Path) -> str:
+        """Compute a version hash from file contents."""
+        try:
+            content = path.read_bytes()
+            return hashlib.sha256(content).hexdigest()[:16]
+        except Exception:
+            return "unknown"
 
 
 class DiffAnalyzer:
@@ -204,27 +248,12 @@ class DiffAnalyzer:
 
         return False, diff_text, change_type
 
-    @staticmethod
-    def compare_environments(old: dict[str, str], new: dict[str, str]) -> list[str]:
-        """Compare environment fingerprints and return significant differences."""
-        differences = []
-        all_keys = set(old.keys()) | set(new.keys())
-
-        for key in sorted(all_keys):
-            old_val = old.get(key, "<missing>")
-            new_val = new.get(key, "<missing>")
-            if old_val != new_val:
-                differences.append(f"{key}: {old_val} -> {new_val}")
-
-        return differences
-
 
 class ReplayEngine:
     """Core engine for replaying and analyzing tool executions."""
 
     def __init__(self, tool_loader: ToolLoader):
         self.tool_loader = tool_loader
-        self.diff_analyzer = DiffAnalyzer()
 
     def replay_bundle(self, bundle: ExecutionBundle, fresh_exec: bool = False) -> ReplayResult:
         """
@@ -232,11 +261,9 @@ class ReplayEngine:
 
         Args:
             bundle: The original execution bundle
-            fresh_exec: If True, attempt to execute with current implementation
-                       to detect drift
+            fresh_exec: If True, execute with current implementation to detect drift
         """
         if not fresh_exec:
-            # In simple replay mode, just return the stored result
             return ReplayResult(
                 success=bundle.error is None,
                 output=bundle.output,
@@ -248,36 +275,42 @@ class ReplayEngine:
             )
 
         # Fresh execution: load and run the tool
-        tool_fn = self.tool_loader.load_tool(bundle.tool_name)
-        if tool_fn is None:
+        load_result = self.tool_loader.load_tool(bundle.tool_name)
+        if load_result is None:
             return ReplayResult(
                 success=False,
                 error=f"Could not load tool: {bundle.tool_name}",
                 tool_version="unknown",
-                diff_explanation="Tool not available for replay"
+                diff_explanation="Tool not available for replay. "
+                                "Ensure the tool exists in the specified module or in tools.<name>."
             )
+
+        tool_fn, tool_version = load_result
 
         try:
             import time
             start = time.time()
-            result = tool_fn(*bundle.input_args.values(), **bundle.input_kwargs)
+
+            # Reconstruct arguments
+            args = tuple(bundle.input_args.get(i) for i in sorted(bundle.input_args.keys()))
+            result = tool_fn(*args, **bundle.input_kwargs)
             duration = int((time.time() - start) * 1000)
 
             # Compare with original
-            is_equal, diff_text, change_type = self.diff_analyzer.compare_outputs(
+            is_equal, diff_text, change_type = DiffAnalyzer.compare_outputs(
                 bundle.output, result
             )
 
             diff_explanation = "Outputs match exactly" if is_equal else (
-                f"Output changed ({change_type}). Diff:\n{diff_text[:500]}" +
-                ("..." if len(diff_text) > 500 else "")
+                f"Output changed ({change_type}). Diff:\n{diff_text[:1000]}" +
+                ("..." if len(diff_text) > 1000 else "")
             )
 
             return ReplayResult(
                 success=True,
                 output=result,
                 duration_ms=duration,
-                tool_version="current",  # Would compute from source
+                tool_version=tool_version,
                 diff_explanation=diff_explanation,
                 change_type="none" if is_equal else change_type
             )
@@ -292,26 +325,20 @@ class ReplayEngine:
             )
 
     def diff_bundles(self, old_bundle: ExecutionBundle, new_bundle: ExecutionBundle) -> dict[str, Any]:
-        """
-        Compare two execution bundles and produce a differential report.
-        """
-        # Compare outputs
-        outputs_equal, diff_text, change_type = self.diff_analyzer.compare_outputs(
+        """Compare two execution bundles and produce a differential report."""
+        outputs_equal, diff_text, change_type = DiffAnalyzer.compare_outputs(
             old_bundle.output, new_bundle.output
         )
 
-        # Compare environments
-        env_differences = self.diff_analyzer.compare_environments(
+        env_differences = self._compare_environments(
             old_bundle.env_fingerprint, new_bundle.env_fingerprint
         )
 
-        # Analyze duration changes
         duration_change = new_bundle.duration_ms - old_bundle.duration_ms
         duration_change_pct = (
             (duration_change / old_bundle.duration_ms * 100) if old_bundle.duration_ms > 0 else 0
         )
 
-        # Determine overall assessment
         assessment = []
         if not outputs_equal:
             if change_type == "contract_change":
@@ -329,12 +356,8 @@ class ReplayEngine:
         if abs(duration_change_pct) > 20:
             assessment.append(f"Duration changed by {duration_change_pct:+.1f}%")
 
-        # Determine health status
-        has_critical = change_type == "contract_change" or (
-            not outputs_equal and "error" in str(new_bundle.output).lower() if new_bundle.output else False
-        )
-        has_drift = not outputs_equal and not has_critical
-        health = "failed" if has_critical else ("degraded" if has_drift else "passed")
+        has_critical = change_type == "contract_change"
+        health = "failed" if has_critical else ("degraded" if not outputs_equal else "passed")
 
         return {
             "comparison_ts": datetime.now(timezone.utc).isoformat(),
@@ -353,7 +376,7 @@ class ReplayEngine:
             "output_comparison": {
                 "outputs_equal": outputs_equal,
                 "change_type": change_type,
-                "diff_preview": diff_text[:1000] if diff_text else None,
+                "diff_preview": diff_text[:2000] if diff_text else None,
             },
             "environment_comparison": {
                 "differences": env_differences,
@@ -370,6 +393,20 @@ class ReplayEngine:
                 "messages": assessment,
             },
         }
+
+    @staticmethod
+    def _compare_environments(old: dict[str, str], new: dict[str, str]) -> list[str]:
+        """Compare environment fingerprints and return significant differences."""
+        differences = []
+        all_keys = set(old.keys()) | set(new.keys())
+
+        for key in sorted(all_keys):
+            old_val = old.get(key, "<missing>")
+            new_val = new.get(key, "<missing>")
+            if old_val != new_val:
+                differences.append(f"{key}: {old_val} -> {new_val}")
+
+        return differences
 
 
 def load_bundle(path: Path) -> ExecutionBundle:
@@ -394,10 +431,9 @@ def get_env_fingerprint() -> dict[str, str]:
     fp = {
         "python_version": sys.version.split()[0],
         "platform": platform.platform(),
-        "processor": platform.processor(),
+        "processor": platform.processor() or "unknown",
     }
 
-    # Include relevant env vars (non-sensitive)
     for var in ["PATH", "PYTHONPATH", "VIRTUAL_ENV", "HOME"]:
         val = os.environ.get(var, "")
         if val:
@@ -430,7 +466,7 @@ def capture_execution(
         tool_name=tool_name,
         tool_call_id=f"call_{int(datetime.now(timezone.utc).timestamp() * 1000)}",
         tool_version=tool_version,
-        input_args=dict(enumerate(args)),  # Convert to dict for JSON
+        input_args=dict(enumerate(args)),
         input_kwargs=kwargs,
         env_fingerprint=get_env_fingerprint(),
         output=output,
@@ -451,32 +487,43 @@ def cmd_replay(args: argparse.Namespace) -> int:
     except json.JSONDecodeError as e:
         print(f"Error: Invalid JSON in bundle: {e}", file=sys.stderr)
         return 1
+    except KeyError as e:
+        print(f"Error: Bundle missing required field: {e}", file=sys.stderr)
+        return 1
 
     tool_loader = ToolLoader(Path(args.tool_path) if args.tool_path else None)
     engine = ReplayEngine(tool_loader)
     result = engine.replay_bundle(bundle, fresh_exec=args.fresh)
 
-    # Output result
     if args.quiet:
         print(json.dumps(result.to_dict(), separators=(",", ":")))
     else:
-        print(f"\n=== Replay Result ===")
-        print(f"Tool: {bundle.tool_name}")
-        print(f"Call ID: {bundle.tool_call_id}")
-        print(f"Status: {'SUCCESS' if result.success else 'FAILED'}")
-        print(f"Duration: {result.duration_ms}ms")
-        print(f"Version: {result.tool_version}")
-
-        if result.error:
-            print(f"\nError: {result.error}")
-        elif result.output is not None:
-            output_preview = json.dumps(result.output, indent=2) if isinstance(result.output, (dict, list)) else str(result.output)
-            print(f"\nOutput (truncated):\n{output_preview[:500]}{'...' if len(str(result.output)) > 500 else ''}")
-
-        if result.diff_explanation and result.diff_explanation != "Original replay (no comparison)":
-            print(f"\n--- Diff Analysis ---\n{result.diff_explanation}")
+        _print_replay_result(bundle, result)
 
     return 0 if result.success else 1
+
+
+def _print_replay_result(bundle: ExecutionBundle, result: ReplayResult) -> None:
+    """Format and print replay result."""
+    print(f"\n=== Replay Result ===")
+    print(f"Tool: {bundle.tool_name}")
+    print(f"Call ID: {bundle.tool_call_id}")
+    print(f"Status: {'SUCCESS' if result.success else 'FAILED'}")
+    print(f"Duration: {result.duration_ms}ms")
+    print(f"Version: {result.tool_version}")
+
+    if result.error:
+        print(f"\nError: {result.error}")
+    elif result.output is not None:
+        if isinstance(result.output, (dict, list)):
+            output_preview = json.dumps(result.output, indent=2)
+        else:
+            output_preview = str(result.output)
+        truncated = output_preview[:1000] if len(output_preview) > 1000 else output_preview
+        print(f"\nOutput:\n{truncated}" + ("..." if len(output_preview) > 1000 else ""))
+
+    if result.diff_explanation and result.diff_explanation != "Original replay (no comparison)":
+        print(f"\n--- Analysis ---\n{result.diff_explanation}")
 
 
 def cmd_diff(args: argparse.Namespace) -> int:
@@ -495,6 +542,9 @@ def cmd_diff(args: argparse.Namespace) -> int:
     except json.JSONDecodeError as e:
         print(f"Error: Invalid JSON: {e}", file=sys.stderr)
         return 1
+    except KeyError as e:
+        print(f"Error: Bundle missing required field: {e}", file=sys.stderr)
+        return 1
 
     tool_loader = ToolLoader()
     engine = ReplayEngine(tool_loader)
@@ -503,33 +553,38 @@ def cmd_diff(args: argparse.Namespace) -> int:
     if args.json:
         print(json.dumps(report, indent=2))
     else:
-        print(f"\n=== Differential Report ===")
-        print(f"Tool: {old_bundle.tool_name}")
-        print(f"\n--- Assessment ---")
-        for msg in report["assessment"]["messages"]:
-            print(f"  {msg}")
-        print(f"\nHealth: {report['assessment']['health'].upper()}")
-
-        if report["environment_comparison"]["differences"]:
-            print(f"\n--- Environment Changes ({len(report['environment_comparison']['differences'])}) ---")
-            for diff in report["environment_comparison"]["differences"][:10]:
-                print(f"  {diff}")
-            if len(report["environment_comparison"]["differences"]) > 10:
-                print(f"  ... and {len(report['environment_comparison']['differences']) - 10} more")
-
-        print(f"\n--- Duration ---")
-        old_d = report["duration_comparison"]["old_ms"]
-        new_d = report["duration_comparison"]["new_ms"]
-        print(f"  Old: {old_d}ms")
-        print(f"  New: {new_d}ms ({report['duration_comparison']['change_pct']:+.1f}%)")
-
-        if report["output_comparison"]["diff_preview"]:
-            print(f"\n--- Output Diff ---")
-            print(report["output_comparison"]["diff_preview"][:800])
-            if len(report["output_comparison"]["diff_preview"]) > 800:
-                print("... (truncated, use --json for full diff)")
+        _print_diff_report(report)
 
     return 0 if report["assessment"]["health"] == "passed" else 1
+
+
+def _print_diff_report(report: dict[str, Any]) -> None:
+    """Format and print differential report."""
+    print(f"\n=== Differential Report ===")
+    print(f"\n--- Assessment ---")
+    for msg in report["assessment"]["messages"]:
+        print(f"  {msg}")
+    print(f"\nHealth: {report['assessment']['health'].upper()}")
+
+    if report["environment_comparison"]["differences"]:
+        print(f"\n--- Environment Changes ({len(report['environment_comparison']['differences'])}) ---")
+        for diff in report["environment_comparison"]["differences"][:10]:
+            print(f"  {diff}")
+        if len(report["environment_comparison"]["differences"]) > 10:
+            print(f"  ... and {len(report['environment_comparison']['differences']) - 10} more")
+
+    print(f"\n--- Duration ---")
+    old_d = report["duration_comparison"]["old_ms"]
+    new_d = report["duration_comparison"]["new_ms"]
+    print(f"  Old: {old_d}ms")
+    print(f"  New: {new_d}ms ({report['duration_comparison']['change_pct']:+.1f}%)")
+
+    if report["output_comparison"]["diff_preview"]:
+        print(f"\n--- Output Diff ---")
+        preview = report["output_comparison"]["diff_preview"][:800]
+        print(preview)
+        if len(report["output_comparison"]["diff_preview"]) > 800:
+            print("... (truncated, use --json for full diff)")
 
 
 def cmd_capture(args: argparse.Namespace) -> int:
@@ -599,7 +654,7 @@ Examples:
     )
     replay_parser.add_argument("bundle", type=Path, help="Path to execution bundle JSON")
     replay_parser.add_argument("--fresh", action="store_true", help="Execute with current code to detect drift")
-    replay_parser.add_argument("--tool-path", type=str, help="Path to tool implementation module")
+    replay_parser.add_argument("--tool-path", type=str, help="Path to tool implementation module (.py file)")
     replay_parser.add_argument("--quiet", "-q", action="store_true", help="JSON output only")
     replay_parser.set_defaults(func=cmd_replay)
 
